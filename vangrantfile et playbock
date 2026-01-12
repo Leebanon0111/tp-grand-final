@@ -1,0 +1,190 @@
+Vagrant.configure("2") do |config|
+  # Provider VMware Desktop
+  config.vm.provider "vmware_desktop" do |vmw|
+    vmw.memory = 2048
+    vmw.cpus   = 2
+  end
+
+  # Réseau privé (host-only VMware)
+  ADMIN_IP  = "192.168.56.10"
+  NODE1_IP  = "192.168.56.11"
+  NODE2_IP  = "192.168.56.12"
+  WINSRV_IP = "192.168.56.20"
+
+  UBUNTU_BOX = "generic/ubuntu2204"
+  REDHAT_BOX = "generic/rhel9"
+  WIN_BOX    = "gusztavvargadr/windows-server-2022"
+
+  # ADMIN : Ubuntu + Ansible
+  config.vm.define "admin" do |admin|
+    admin.vm.hostname = "admin"
+    admin.vm.box = UBUNTU_BOX
+    admin.vm.network "private_network", ip: ADMIN_IP
+
+    # Dossier ansible côté hôte -> /vagrant/ansible côté VM
+    admin.vm.synced_folder "./ansible", "/vagrant/ansible"
+
+    admin.vm.provider "vmware_desktop" do |vmw|
+      vmw.memory = 3072
+      vmw.cpus   = 2
+    end
+
+    admin.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -y
+      apt-get install -y ansible git python3-pip
+      ansible-galaxy collection install ansible.windows community.windows
+
+      # Petit délai pour laisser WinRM démarrer au 1er boot Windows
+      sleep 20
+
+      # Lancer le durcissement Windows
+      cd /vagrant/ansible
+      ansible-playbook -i inventory.ini windows_hardening.yml
+    SHELL
+  end
+
+  # NODE01 : RedHat - cluster HA
+  config.vm.define "node01" do |node|
+    node.vm.hostname = "node01"
+    node.vm.box = REDHAT_BOX
+    node.vm.network "private_network", ip: NODE1_IP
+  end
+
+  # NODE02 : RedHat - cluster HA
+  config.vm.define "node02" do |node|
+    node.vm.hostname = "node02"
+    node.vm.box = REDHAT_BOX
+    node.vm.network "private_network", ip: NODE2_IP
+  end
+
+  # WINSRV : Windows Server - cible Ansible
+  config.vm.define "winsrv" do |winsrv|
+    winsrv.vm.hostname = "winsrv"
+    winsrv.vm.box = WIN_BOX
+    winsrv.vm.network "private_network", ip: WINSRV_IP
+
+    winsrv.vm.provider "vmware_desktop" do |vmw|
+      vmw.memory = 4096
+      vmw.cpus   = 2
+    end
+
+    # WinRM pour Ansible (LABO en HTTP 5985)
+    winsrv.vm.provision "shell", inline: <<-SHELL
+      powershell -ExecutionPolicy Bypass -NoLogo -NonInteractive -NoProfile -Command "
+        Set-ExecutionPolicy RemoteSigned -Force;
+        winrm quickconfig -q;
+        winrm set winrm/config/winrs '@{MaxMemoryPerShellMB=\"1024\"}';
+        winrm set winrm/config '@{MaxTimeoutms=\"1800000\"}';
+        winrm set winrm/config/service/auth '@{Basic=\"true\"}';
+        winrm set winrm/config/service '@{AllowUnencrypted=\"true\"}';
+        Set-Item -Path 'WSMan:\\localhost\\Client\\TrustedHosts' -Value '#{ADMIN_IP}' -Force;
+        netsh advfirewall firewall add rule name='WinRM-HTTP' dir=in action=allow protocol=TCP localport=5985;
+      "
+    SHELL
+  end
+end
+
+Playbock
+---
+- name: Durcissement ANSSI d'un Windows Server (labo)
+  hosts: windows
+  gather_facts: yes
+
+  vars:
+    ansible_connection: winrm
+    ansible_user: administrateur
+    ansible_password: "MotDePasseASecuriser"
+
+    # WinRM LABO (HTTP comme Vagrant)
+    ansible_port: 5985
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+
+  tasks:
+    # 1) Mises à jour
+    - name: Installer toutes les mises à jour critiques et importantes
+      ansible.windows.win_updates:
+        category_names:
+          - SecurityUpdates
+          - CriticalUpdates
+        reboot: yes
+        reboot_timeout: 3600
+
+    # 2) Pare-feu
+    - name: Activer le pare-feu sur tous les profils
+      ansible.windows.win_firewall:
+        state: enabled
+        profiles:
+          - domain
+          - private
+          - public
+
+    - name: Autoriser uniquement les flux RDP depuis le réseau d’admin
+      ansible.windows.win_firewall_rule:
+        name: "RDP_Admin"
+        localport: 3389
+        protocol: TCP
+        action: allow
+        direction: in
+        remoteip: "10.0.0.0/24"
+        state: present
+        enabled: yes
+
+    # 3) Compte Administrateur local
+    - name: Renommer le compte Administrateur local
+      ansible.windows.win_user:
+        name: "Administrateur"
+        new_name: "adm-local-srv"
+        state: present
+
+    - name: Définir un mot de passe complexe sur le compte adm-local-srv
+      ansible.windows.win_user:
+        name: "adm-local-srv"
+        password: "{{ lookup('ansible.builtin.password', '/dev/null length=24 chars=ascii_letters,digits') }}"
+        update_password: always
+        state: present
+
+    # 4) BitLocker (optionnel en VM)
+    - name: Installer la fonctionnalité BitLocker si nécessaire
+      ansible.windows.win_feature:
+        name: BitLocker
+        state: present
+        include_management_tools: yes
+      register: bitlocker_feature
+
+    - name: Activer BitLocker sur C: (si supporté)
+      community.windows.win_bitlocker:
+        drive_letter: C:
+        state: encrypted
+        encryption_method: XtsAes256
+        password: "{{ lookup('ansible.builtin.password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+        recovery_password: yes
+        used_space_only: no
+      ignore_errors: yes
+
+    # 5) Désactiver SMBv1
+    - name: Désactiver SMBv1 via registre
+      ansible.windows.win_registry:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+        name: SMB1
+        type: dword
+        data: 0
+
+    - name: Désinstaller la fonctionnalité SMB1
+      ansible.windows.win_feature:
+        name: FS-SMB1
+        state: absent
+
+    # 6) Journalisation & audit
+    - name: Augmenter la taille du journal de sécurité
+      ansible.windows.win_eventlog:
+        name: Security
+        maximum_size: 196608
+        overflow_action: OverwriteAsNeeded
+
+    - name: Activer l’audit des logons réussis et échoués
+      ansible.windows.win_audit_policy_system:
+        category: Logon
+        subcategory: "Logon"
+        audit_type: success, failure
