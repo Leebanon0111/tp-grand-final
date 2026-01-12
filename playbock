@@ -1,0 +1,103 @@
+Playbock
+---
+- name: Durcissement ANSSI d'un Windows Server (labo)
+  hosts: windows
+  gather_facts: yes
+
+  vars:
+    ansible_connection: winrm
+    ansible_user: administrateur
+    ansible_password: "MotDePasseASecuriser"
+
+    # WinRM LABO (HTTP comme Vagrant)
+    ansible_port: 5985
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+
+  tasks:
+    # 1) Mises à jour
+    - name: Installer toutes les mises à jour critiques et importantes
+      ansible.windows.win_updates:
+        category_names:
+          - SecurityUpdates
+          - CriticalUpdates
+        reboot: yes
+        reboot_timeout: 3600
+
+    # 2) Pare-feu
+    - name: Activer le pare-feu sur tous les profils
+      ansible.windows.win_firewall:
+        state: enabled
+        profiles:
+          - domain
+          - private
+          - public
+
+    - name: Autoriser uniquement les flux RDP depuis le réseau d’admin
+      ansible.windows.win_firewall_rule:
+        name: "RDP_Admin"
+        localport: 3389
+        protocol: TCP
+        action: allow
+        direction: in
+        remoteip: "10.0.0.0/24"
+        state: present
+        enabled: yes
+
+    # 3) Compte Administrateur local
+    - name: Renommer le compte Administrateur local
+      ansible.windows.win_user:
+        name: "Administrateur"
+        new_name: "adm-local-srv"
+        state: present
+
+    - name: Définir un mot de passe complexe sur le compte adm-local-srv
+      ansible.windows.win_user:
+        name: "adm-local-srv"
+        password: "{{ lookup('ansible.builtin.password', '/dev/null length=24 chars=ascii_letters,digits') }}"
+        update_password: always
+        state: present
+
+    # 4) BitLocker (optionnel en VM)
+    - name: Installer la fonctionnalité BitLocker si nécessaire
+      ansible.windows.win_feature:
+        name: BitLocker
+        state: present
+        include_management_tools: yes
+      register: bitlocker_feature
+
+    - name: Activer BitLocker sur C: (si supporté)
+      community.windows.win_bitlocker:
+        drive_letter: C:
+        state: encrypted
+        encryption_method: XtsAes256
+        password: "{{ lookup('ansible.builtin.password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+        recovery_password: yes
+        used_space_only: no
+      ignore_errors: yes
+
+    # 5) Désactiver SMBv1
+    - name: Désactiver SMBv1 via registre
+      ansible.windows.win_registry:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+        name: SMB1
+        type: dword
+        data: 0
+
+    - name: Désinstaller la fonctionnalité SMB1
+      ansible.windows.win_feature:
+        name: FS-SMB1
+        state: absent
+
+    # 6) Journalisation & audit
+    - name: Augmenter la taille du journal de sécurité
+      ansible.windows.win_eventlog:
+        name: Security
+        maximum_size: 196608
+        overflow_action: OverwriteAsNeeded
+
+    - name: Activer l’audit des logons réussis et échoués
+      ansible.windows.win_audit_policy_system:
+        category: Logon
+        subcategory: "Logon"
+        audit_type: success, failure
